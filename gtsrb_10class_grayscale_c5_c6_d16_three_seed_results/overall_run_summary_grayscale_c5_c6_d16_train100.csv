@@ -1,0 +1,4 @@
+﻿run_tag,model_tag,conv1_filters,conv2_filters,dense_units,input_color_mode,input_channels,split_seed,training_seed,epochs_ran,best_validation_accuracy,test_loss,test_accuracy,macro_precision,macro_recall,macro_f1,weighted_f1
+grayscale_c5_c6_d16_split42_train100,grayscale_c5_c6_d16,5,6,16,grayscale,1,42,100,23,0.945752,0.264247,0.935294,0.928957,0.916578,0.919840,0.934365
+grayscale_c5_c6_d16_split100_train100,grayscale_c5_c6_d16,5,6,16,grayscale,1,100,100,45,0.975801,0.256893,0.955556,0.949991,0.965833,0.955350,0.955018
+grayscale_c5_c6_d16_split2026_train100,grayscale_c5_c6_d16,5,6,16,grayscale,1,2026,100,39,0.949673,0.471382,0.914379,0.898685,0.921048,0.902588,0.915848
