@@ -15,11 +15,22 @@
 import sys
 import glob
 import os
+import time
 
 import numpy as np
 import cv2
 import serial
 import serial.tools.list_ports
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+import tensorflow as tf
+
+MODEL_PATH = os.path.join(
+    os.path.dirname(__file__),
+    "gtsrb_10class_grayscale_c5_c6_d16_three_seed_results",
+    "grayscale_c5_c6_d16_split100_train100",
+    "best_model_grayscale_c5_c6_d16_split100_train100.keras"
+)
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap
@@ -107,7 +118,7 @@ def softmax(x):
 #  시리얼 워커 스레드 (UART 송수신은 블로킹이므로 별도 스레드)
 # ---------------------------------------------------------------------
 class SerialWorker(QThread):
-    finished_ok = pyqtSignal(int, object)    # (pred_class, logits ndarray)
+    finished_ok = pyqtSignal(int, object, float)  # (pred_class, logits, elapsed_ms)
     failed = pyqtSignal(str)
 
     def __init__(self, port, payload):
@@ -120,11 +131,14 @@ class SerialWorker(QThread):
             with serial.Serial(self.port, BAUD, timeout=3) as ser:
                 ser.reset_input_buffer()
                 ser.reset_output_buffer()
+                t0 = time.perf_counter()
                 ser.write(self.payload)      # 784바이트 전송
                 ser.flush()
 
                 # 42바이트 결과패킷 수신
                 pkt = ser.read(PACKET_BYTES)
+                elapsed_ms = (time.perf_counter() - t0) * 1000
+
                 if len(pkt) != PACKET_BYTES:
                     self.failed.emit(
                         f"패킷 수신 실패: {len(pkt)}/{PACKET_BYTES} 바이트")
@@ -134,7 +148,7 @@ class SerialWorker(QThread):
                     return
                 pred = pkt[1]
                 logits = np.frombuffer(pkt[2:42], dtype="<i4").astype(np.int64)
-                self.finished_ok.emit(pred, logits)
+                self.finished_ok.emit(pred, logits, elapsed_ms)
         except Exception as e:
             self.failed.emit(str(e))
 
@@ -176,8 +190,14 @@ class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("FPGA NPU 교통표지판 분류 데모")
-        self.resize(1200, 750)
+        self.resize(950, 750)
         self.worker = None
+        try:
+            self.keras_model = tf.keras.models.load_model(MODEL_PATH)
+            self.keras_model.predict(np.zeros((1, 28, 28, 1), dtype=np.float32), verbose=0)
+        except Exception as e:
+            self.keras_model = None
+            print(f"모델 로드 실패: {e}")
         self._build_ui()
 
     def _build_ui(self):
@@ -206,34 +226,60 @@ class MainWindow(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(self.grid_host)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         mid.addWidget(scroll, 3)
 
         # 결과 패널
         right = QVBoxLayout()
-        right.addWidget(QLabel("<b>입력 (28×28, FPGA로 전송됨)</b>"))
         self.preview = QLabel()
         self.preview.setFixedSize(240, 240)
         self.preview.setStyleSheet("border:1px solid #888; background:#000;")
         self.preview.setAlignment(Qt.AlignCenter)
         right.addWidget(self.preview)
 
-        right.addWidget(QLabel("<b>실제 정답</b>"))
+        lbl_truth_header = QLabel("<b>실제 정답</b>")
+        lbl_truth_header.setStyleSheet("font-size:20px;")
+        right.addWidget(lbl_truth_header)
         self.truth_lbl = QLabel("—")
-        self.truth_lbl.setStyleSheet("font-size:18px; color:#1a7a1a;")
+        self.truth_lbl.setStyleSheet("font-size:26px; font-weight:bold; color:#1a7a1a;")
         right.addWidget(self.truth_lbl)
 
-        right.addWidget(QLabel("<b>예측 결과</b>"))
+        lbl_pred_header = QLabel("<b>FPGA 예측 결과</b>")
+        lbl_pred_header.setStyleSheet("font-size:20px;")
+        right.addWidget(lbl_pred_header)
         self.result_lbl = QLabel("—")
         self.result_lbl.setStyleSheet("font-size:26px; font-weight:bold;")
         right.addWidget(self.result_lbl)
 
+        self.fpga_time_lbl = QLabel("")
+        self.fpga_time_lbl.setStyleSheet("font-size:13px; color:#555;")
+        right.addWidget(self.fpga_time_lbl)
+        right.addSpacing(10)
+
+        lbl_py_header = QLabel("<b>Python 예측 결과</b>")
+        lbl_py_header.setStyleSheet("font-size:20px;")
+        right.addWidget(lbl_py_header)
+        self.py_result_lbl = QLabel("—")
+        self.py_result_lbl.setStyleSheet("font-size:26px; font-weight:bold; color:#1a3a8a;")
+        right.addWidget(self.py_result_lbl)
+        self.py_time_lbl = QLabel("")
+        self.py_time_lbl.setStyleSheet("font-size:13px; color:#555;")
+        right.addWidget(self.py_time_lbl)
+        right.addSpacing(16)
+
         # confidence 상위 막대들
         self.bars = []
-        for _ in range(3):
+        for i in range(3):
             row = QHBoxLayout()
-            name = QLabel("—"); name.setFixedWidth(140)
+            rank = QLabel(f"{i+1}.")
+            rank.setFixedWidth(22)
+            rank.setStyleSheet("font-size:15px; font-weight:bold;")
+            name = QLabel("—"); name.setFixedWidth(130)
+            name.setStyleSheet("font-size:15px;")
             bar = QProgressBar(); bar.setMaximum(100); bar.setTextVisible(True)
-            row.addWidget(name); row.addWidget(bar)
+            bar.setFixedHeight(28)
+            bar.setStyleSheet("font-size:14px;")
+            row.addWidget(rank); row.addWidget(name); row.addWidget(bar)
             right.addLayout(row)
             self.bars.append((name, bar))
 
@@ -275,7 +321,14 @@ class MainWindow(QWidget):
         # GTSRB ROI csv(GT-*.csv) 있으면 읽기 {filename: (x1,y1,x2,y2)}
         roi_map = {}
         self.label_map = {}
-        for csv_path in glob.glob(os.path.join(folder, "GT-*.csv")):
+        # 현재 폴더 + 상위 폴더 + 상위상위 폴더에서 GT-*.csv 탐색
+        search_dirs = [folder,
+                       os.path.dirname(folder),
+                       os.path.dirname(os.path.dirname(folder))]
+        csv_paths = []
+        for d in search_dirs:
+            csv_paths += glob.glob(os.path.join(d, "GT-*.csv"))
+        for csv_path in csv_paths:
             try:
                 import csv as _csv
                 with open(csv_path, newline="") as f:
@@ -324,7 +377,21 @@ class MainWindow(QWidget):
         # 실제 정답 표시
         fn = os.path.basename(path)
         truth = getattr(self, "label_map", {}).get(fn, "정보 없음")
-        self.truth_lbl.setText(truth)
+        self.truth_lbl.setText(f"➜ {truth}")
+
+        # Python 추론
+        if self.keras_model is not None:
+            inp = gray.astype(np.float32) / 255.0
+            inp = inp.reshape(1, 28, 28, 1)
+            t0 = time.perf_counter()
+            py_pred = np.argmax(self.keras_model.predict(inp, verbose=0))
+            py_ms = (time.perf_counter() - t0) * 1000
+            py_name = CLASS_NAMES[py_pred] if 0 <= py_pred < 10 else f"?{py_pred}"
+            self.py_result_lbl.setText(f"➜ {py_name}(#{py_pred})")
+            self.py_time_lbl.setText(f"추론 시간: {py_ms:.1f} ms")
+        else:
+            self.py_result_lbl.setText("모델 없음")
+            self.py_time_lbl.setText("")
 
         port = self.port_box.currentText()
         if port.startswith("("):
@@ -342,21 +409,22 @@ class MainWindow(QWidget):
         self.worker.start()
 
     # ---- 결과 수신 ----
-    def on_result(self, pred, logits):
+    def on_result(self, pred, logits, fpga_ms):
         # Q14 logit -> 실수 -> softmax
         real = logits.astype(np.float64) / 16384.0
         prob = softmax(real)
         order = np.argsort(prob)[::-1]
 
         name = CLASS_NAMES[pred] if 0 <= pred < 10 else f"?{pred}"
-        self.result_lbl.setText(f"{name}  (#{pred})")
+        self.result_lbl.setText(f"➜ {name}(#{pred})")
+        self.fpga_time_lbl.setText(f"추론 시간: {fpga_ms:.1f} ms")
 
         for k, (lbl, bar) in enumerate(self.bars):
             idx = int(order[k])
             lbl.setText(CLASS_NAMES[idx])
             bar.setValue(int(round(prob[idx] * 100)))
             bar.setFormat(f"{prob[idx]*100:.1f}%")
-        self.status.setText("완료. 다른 이미지를 클릭하세요.")
+        self.status.setText("")
 
     def on_fail(self, msg):
         self.result_lbl.setText("실패")
